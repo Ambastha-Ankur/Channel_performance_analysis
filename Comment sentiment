@@ -1,0 +1,347 @@
+import os
+import time
+from datetime import datetime
+import mysql.connector
+from mysql.connector import Error
+from googleapiclient.discovery import build
+from textblob import TextBlob
+
+# ✅ YouTube API Key
+API_KEY = "AIzaSyB86I578efuEgHWP6lxxcIWDJS7Uhvmvmg"
+
+# 🔁 ADD MULTIPLE CHANNEL IDs HERE
+CHANNEL_IDS = {
+    "UCL6GYjerpuqfxqCyFX-cKmA",
+    "UCc8OACBPjT51TF8b-GIdNeg",
+    "UC8_W-j1L0ZIg-6tU_H64hIQ"
+}
+
+# --------------------------------------------------
+# 1️⃣  MySQL Connection Setup
+# --------------------------------------------------
+def get_mysql_connection():
+    host = "localhost"
+    user = "Ankur"  # ✅ Change to your MySQL username
+    password = "0208"  # ✅ Change to your MySQL password
+    database = "channel",
+# ✅ Change to your DB name
+
+    try:
+        conn = mysql.connector.connect(
+            host=host,
+            user=user,
+            password=password,
+            database=database,
+            auth_plugin='mysql_native_password'
+        )
+
+        if conn.is_connected():
+            cursor = conn.cursor()
+            cursor.execute("SET NAMES utf8mb4;")
+            cursor.execute("SET CHARACTER SET utf8mb4;")
+            cursor.execute("SET character_set_connection=utf8mb4;")
+            print("✅ Connected to MySQL with utf8mb4 encoding")
+            return conn
+
+    except Error as e:
+        print(f"❌ MySQL connection failed: {e}")
+        raise
+
+
+# --------------------------------------------------
+# 2️⃣  Create Table with Channel Support
+# --------------------------------------------------
+def create_table(conn):
+    cursor = conn.cursor()
+    cursor.execute("""
+                   CREATE TABLE IF NOT EXISTS comments(
+                       id INT AUTO_INCREMENT PRIMARY KEY,
+                       channel_id VARCHAR (50),
+                       channel_name TEXT,
+                       video_id VARCHAR (50),
+                       video_title TEXT,
+                       comment_id VARCHAR (100) UNIQUE,
+                       author_name TEXT,
+                       comment_text TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci,
+                       like_count INT,
+                       published_at DATETIME,
+                       parent_id VARCHAR (100),
+                       polarity FLOAT,
+                       sentiment VARCHAR (50),
+                       fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                       INDEX idx_channel(channel_id),
+                       INDEX idx_video (video_id),
+                       INDEX idx_comment(comment_id)
+                       ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+                   """)
+    conn.commit()
+    print("🗄️ Table 'comments' ready with multi-channel support")
+
+
+# --------------------------------------------------
+# 3️⃣  Sentiment Analysis Helper
+# --------------------------------------------------
+def analyze_sentiment(text):
+    try:
+        blob = TextBlob(text)
+        polarity = blob.sentiment.polarity
+        if polarity > 0:
+            sentiment = "Positive"
+        elif polarity < 0:
+            sentiment = "Negative"
+        else:
+            sentiment = "Neutral"
+        return polarity, sentiment
+    except Exception:
+        return 0.0, "Neutral"
+
+
+# --------------------------------------------------
+# 4️⃣  Get Channel Name
+# --------------------------------------------------
+def get_channel_name(youtube, channel_id):
+    try:
+        request = youtube.channels().list(
+            part="snippet",
+            id=channel_id
+        )
+        response = request.execute()
+        if response["items"]:
+            return response["items"][0]["snippet"]["title"]
+        return "Unknown Channel"
+    except Exception as e:
+        print(f"⚠️ Could not fetch channel name: {e}")
+        return "Unknown Channel"
+
+
+# --------------------------------------------------
+# 5️⃣  Fetch All Videos in Channel
+# --------------------------------------------------
+def get_videos(youtube, channel_id):
+    videos = []
+    next_page_token = None
+
+    try:
+        while True:
+            request = youtube.search().list(
+                part="id,snippet",
+                channelId=channel_id,
+                maxResults=50,
+                type="video",
+                order="date",
+                pageToken=next_page_token
+            )
+            response = request.execute()
+
+            for item in response["items"]:
+                video_id = item["id"]["videoId"]
+                title = item["snippet"]["title"]
+                videos.append((video_id, title))
+
+            next_page_token = response.get("nextPageToken")
+            if not next_page_token:
+                break
+
+            time.sleep(1)
+
+        print(f"📹 Found {len(videos)} videos in the channel")
+        return videos
+
+    except Exception as e:
+        print(f"❌ Error fetching videos: {e}")
+        return videos
+
+
+# --------------------------------------------------
+# 6️⃣  Fetch Comments for Each Video
+# --------------------------------------------------
+def fetch_comments(youtube, video_id):
+    comments = []
+    next_page_token = None
+
+    try:
+        while True:
+            request = youtube.commentThreads().list(
+                part="snippet,replies",
+                videoId=video_id,
+                maxResults=100,
+                textFormat="plainText",
+                pageToken=next_page_token
+            )
+            response = request.execute()
+
+            for item in response.get("items", []):
+                snippet = item["snippet"]["topLevelComment"]["snippet"]
+                comment_id = item["snippet"]["topLevelComment"]["id"]
+                author = snippet.get("authorDisplayName", "Unknown")
+                text = snippet.get("textDisplay", "")
+                like_count = snippet.get("likeCount", 0)
+                published_at = snippet.get("publishedAt", None)
+
+                # Convert datetime properly
+                if published_at:
+                    try:
+                        published_at = datetime.strptime(published_at, "%Y-%m-%dT%H:%M:%SZ")
+                    except ValueError:
+                        published_at = None
+
+                comments.append((comment_id, author, text, like_count, published_at, None))
+
+                # Replies (if any)
+                replies = item.get("replies", {}).get("comments", [])
+                for reply in replies:
+                    r_snip = reply["snippet"]
+                    r_id = reply["id"]
+                    r_author = r_snip.get("authorDisplayName", "Unknown")
+                    r_text = r_snip.get("textDisplay", "")
+                    r_likes = r_snip.get("likeCount", 0)
+                    r_published = r_snip.get("publishedAt", None)
+                    if r_published:
+                        try:
+                            r_published = datetime.strptime(r_published, "%Y-%m-%dT%H:%M:%SZ")
+                        except ValueError:
+                            r_published = None
+                    comments.append((r_id, r_author, r_text, r_likes, r_published, comment_id))
+
+            next_page_token = response.get("nextPageToken")
+            if not next_page_token:
+                break
+
+            time.sleep(1)
+
+        return comments
+
+    except Exception as e:
+        print(f"⚠️ Error fetching comments: {e}")
+        return comments
+
+
+# --------------------------------------------------
+# 7️⃣  Insert Data into MySQL
+# --------------------------------------------------
+def insert_comments(conn, channel_id, channel_name, video_id, video_title, comments):
+    cursor = conn.cursor()
+    query = """
+            INSERT INTO comments
+            (channel_id, channel_name, video_id, video_title, comment_id, author_name,
+             comment_text, like_count, published_at, parent_id, polarity, sentiment)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) ON DUPLICATE KEY \
+            UPDATE \
+                like_count = \
+            VALUES (like_count), polarity = \
+            VALUES (polarity), sentiment = \
+            VALUES (sentiment) \
+            """
+    rows = []
+    for (comment_id, author, text, likes, published_at, reply_to) in comments:
+        polarity, sentiment = analyze_sentiment(text)
+        rows.append((
+            channel_id, channel_name, video_id, video_title,
+            comment_id, author, text, likes, published_at,
+            reply_to, polarity, sentiment
+        ))
+
+    if rows:
+        cursor.executemany(query, rows)
+        conn.commit()
+        print(f"   ✅ Inserted/Updated {len(rows)} comments")
+
+
+# --------------------------------------------------
+# 8️⃣  Process Single Channel
+# --------------------------------------------------
+def process_channel(youtube, conn, channel_id):
+    print(f"\n{'=' * 70}")
+    print(f"🎬 Processing Channel: {channel_id}")
+    print(f"{'=' * 70}")
+
+    # Get channel name
+    channel_name = get_channel_name(youtube, channel_id)
+    print(f"📺 Channel Name: {channel_name}")
+
+    # Get all videos
+    videos = get_videos(youtube, channel_id)
+    if not videos:
+        print(f"⚠️ No videos found for channel {channel_id}")
+        return 0, 0
+
+    total_comments = 0
+    videos_processed = 0
+
+    # Process each video
+    for i, (video_id, title) in enumerate(videos, 1):
+        try:
+            print(f"\n📹 Video {i}/{len(videos)}: {title[:60]}...")
+            comments = fetch_comments(youtube, video_id)
+
+            if comments:
+                insert_comments(conn, channel_id, channel_name, video_id, title, comments)
+                total_comments += len(comments)
+                videos_processed += 1
+            else:
+                print(f"   ⚠️ No comments found")
+
+        except Exception as e:
+            print(f"   ❌ Error processing video: {e}")
+            continue
+
+        time.sleep(2)  # Rate limiting
+
+    print(f"\n✅ Channel Summary:")
+    print(f"   Videos Processed: {videos_processed}/{len(videos)}")
+    print(f"   Total Comments: {total_comments}")
+
+    return videos_processed, total_comments
+
+
+# --------------------------------------------------
+# 9️⃣  Main Function
+# --------------------------------------------------
+def main():
+    print("🚀 Starting Multi-Channel YouTube Comments Fetcher")
+    print(f"📊 Channels to process: {len(CHANNEL_IDS)}\n")
+
+    youtube = build("youtube", "v3", developerKey=API_KEY)
+    conn = get_mysql_connection()
+    create_table(conn)
+
+    # Statistics
+    total_channels_processed = 0
+    total_videos_processed = 0
+    total_comments_fetched = 0
+
+    # Process each channel
+    for idx, channel_id in enumerate(CHANNEL_IDS, 1):
+        try:
+            print(f"\n{'#' * 70}")
+            print(f"# Channel {idx}/{len(CHANNEL_IDS)}")
+            print(f"{'#' * 70}")
+
+            videos, comments = process_channel(youtube, conn, channel_id)
+            total_channels_processed += 1
+            total_videos_processed += videos
+            total_comments_fetched += comments
+
+        except Exception as e:
+            print(f"❌ Error processing channel {channel_id}: {e}")
+            print("⏭️ Continuing to next channel...")
+            continue
+
+    # Final summary
+    print(f"\n{'=' * 70}")
+    print(f"🎉 ALL DONE!")
+    print(f"{'=' * 70}")
+    print(f"✅ Channels Processed: {total_channels_processed}/{len(CHANNEL_IDS)}")
+    print(f"📹 Videos Processed: {total_videos_processed}")
+    print(f"💬 Comments Fetched: {total_comments_fetched}")
+    print(f"{'=' * 70}")
+
+    conn.close()
+    print("\n✅ Database connection closed")
+
+
+# --------------------------------------------------
+# Run Script
+# --------------------------------------------------
+if __name__ == "__main__":
+    main()
