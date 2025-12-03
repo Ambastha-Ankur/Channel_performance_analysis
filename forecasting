@@ -1,0 +1,179 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+from prophet import Prophet
+import mysql.connector
+import os
+
+#fetching data from SQL
+def load_youtube_data():
+    conn = mysql.connector.connect(
+        host="localhost",
+        user="Ankur",
+        password="0208",
+        database="channel",
+        charset="utf8mb4"
+    )
+
+    query = """
+        SELECT 
+            published_at,
+            views,
+            likes,
+            comments
+        FROM youtube_videos;
+    """
+
+    df = pd.read_sql(query, conn)
+    conn.close()
+
+    df['published_at'] = pd.to_datetime(df['published_at'])
+
+    df['views'] = pd.to_numeric(df['views'], errors='coerce')
+    df['likes'] = pd.to_numeric(df['likes'], errors='coerce')
+    df['comments'] = pd.to_numeric(df['comments'], errors='coerce')
+
+    return df
+#CREATE monthly_df FUNCTION
+def create_monthly_df(df):
+
+    # Extract YYYY-MM
+    df['year_month'] = df['published_at'].dt.to_period('M').dt.to_timestamp()
+
+    # Aggregate monthly metrics
+    monthly_df = df.groupby('year_month').agg({
+        'views': 'sum',
+        'likes': 'sum',
+        'comments': 'sum'
+    }).reset_index()
+
+    # Rename columns
+    monthly_df = monthly_df.rename(columns={
+        'views': 'monthly_views',
+        'likes': 'monthly_likes',
+        'comments': 'monthly_comments'
+    })
+
+    # Create continuous month range
+    full_range = pd.date_range(
+        start=monthly_df['year_month'].min(),
+        end=monthly_df['year_month'].max(),
+        freq='MS'
+    )
+    full_df = pd.DataFrame({'year_month': full_range})
+
+    # Merge & fill missing months
+    monthly_df = pd.merge(full_df, monthly_df, on='year_month', how='left')
+    monthly_df[['monthly_views', 'monthly_likes', 'monthly_comments']] = (
+        monthly_df[['monthly_views', 'monthly_likes', 'monthly_comments']].fillna(0)
+    )
+
+    return monthly_df
+
+#STEP 3 — FORECAST FUNCTION (Generic for all metrics)
+
+def run_forecast(df, metric):
+    df_prophet = df[['year_month', metric]].rename(columns={
+        'year_month': 'ds',
+        metric: 'y'
+    })
+
+    model = Prophet()
+    model.fit(df_prophet)
+
+    # 12 months forecast
+    future = model.make_future_dataframe(periods=12, freq='MS')
+    forecast = model.predict(future)
+
+    return model, forecast
+
+#PLOT FORECAST
+def plot_forecast(model, forecast, title):
+    fig = model.plot(forecast)
+    plt.title(title)
+    plt.xlabel("Date")
+    plt.ylabel("Value")
+    plt.show()
+
+#STORE FORECAST INTO MYSQL
+def store_forecast_to_mysql(forecast, metric):
+
+    conn = mysql.connector.connect(
+        host="localhost",
+        user="Ankur",
+        password="0208",
+        database="channel",
+        charset="utf8mb4"
+    )
+    cursor = conn.cursor()
+
+    # Create table if not exists
+    safe_metric = metric.lower().replace(" ", "_").replace("-", "_")
+    cursor.execute(f"""
+        CREATE TABLE IF NOT EXISTS ml_forecast_{metric} (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            date DATE,
+            yhat DOUBLE,
+            yhat_lower DOUBLE,
+            yhat_upper DOUBLE
+        );
+    """)
+
+    # Insert rows
+    insert_query = f"""
+        INSERT INTO ml_forecast_{metric} (date, yhat, yhat_lower, yhat_upper)
+        VALUES (%s, %s, %s, %s);
+    """
+
+    for _, row in forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].iterrows():
+        cursor.execute(insert_query, (
+            row['ds'].date(),
+            float(row['yhat']),
+            float(row['yhat_lower']),
+            float(row['yhat_upper'])
+        ))
+
+    conn.commit()
+    conn.close()
+
+#EXPORT TO CSV FOR POWER BI
+def export_to_csv(forecast, metric):
+    folder = "exports"
+    os.makedirs(folder, exist_ok=True)
+
+    filename = f"{folder}/{metric}_forecast.csv"
+
+    forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].to_csv(
+        filename, index=False
+    )
+
+    print(f"✔ Exported CSV: {filename}")
+
+#RUN FULL PIPELINE
+# Load raw data
+df = load_youtube_data()
+
+# Create monthly DataFrame
+monthly_df = create_monthly_df(df)
+
+# Forecast 3 metrics
+metrics = {
+    "monthly_views": "View Forecast",
+    "monthly_likes": "Like Forecast",
+    "monthly_comments": "Comment Forecast"
+}
+
+for metric, title in metrics.items():
+    print(f"\n🚀 Running forecast for: {metric}")
+
+    model, forecast = run_forecast(monthly_df, metric)
+
+    # Plot
+    plot_forecast(model, forecast, title)
+
+    # Store in MySQL
+    store_forecast_to_mysql(forecast, metric)
+
+    # Export to CSV
+    export_to_csv(forecast, metric)
+
+
