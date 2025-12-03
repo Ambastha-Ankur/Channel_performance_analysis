@@ -1,0 +1,360 @@
+#code for fetching data from youtube channel#
+
+import pandas as pd
+import re
+from datetime import datetime, timezone
+from googleapiclient.discovery import build
+import os
+import pymysql
+from pymysql import Error
+
+# ✅ [API KEY]
+API_KEY = "AIzaSyB86I578efuEgHWP6lxxcIWDJS7Uhvmvmg"
+
+# ✅ [MULTIPLE CHANNELS] - Add source name and corresponding channel ID
+CHANNELS = {
+    "SSLCPARIKSHE": "UCL6GYjerpuqfxqCyFX-cKmA",
+    "PUCPARIKSHE": "UCc8OACBPjT51TF8b-GIdNeg",
+    "pucparikshecommerce": "UC8_W-j1L0ZIg-6tU_H64hIQ"
+}
+
+# ✅ [DATABASE CONFIG] - Added charset for emoji support
+DB_CONFIG = {
+    "host": "localhost",
+    "user": "Ankur",
+    "password": "0208",
+    "database": "Channel",
+    "charset": "utf8mb4"
+}
+
+# ✅ Build YouTube API client
+youtube = build('youtube', 'v3', developerKey=API_KEY)
+
+
+# ---------------------- Helper Functions ----------------------
+def iso8601_to_seconds(duration):
+    match = re.match(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?', duration)
+    if not match:
+        return 0
+    h, m, s = match.groups()
+    return int(h or 0) * 3600 + int(m or 0) * 60 + int(s or 0)
+
+
+def iso8601_to_str(duration):
+    seconds = iso8601_to_seconds(duration)
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h:d}:{m:02d}:{s:02d}"
+
+
+def get_uploads_playlist_id(channel_id):
+    resp = youtube.channels().list(part='contentDetails', id=channel_id).execute()
+    return resp['items'][0]['contentDetails']['relatedPlaylists']['uploads']
+
+
+def get_all_video_ids(playlist_id):
+    ids = []
+    next_page_token = None
+    while True:
+        pl_resp = youtube.playlistItems().list(
+            playlistId=playlist_id,
+            part='contentDetails',
+            maxResults=50,
+            pageToken=next_page_token
+        ).execute()
+        ids += [item['contentDetails']['videoId'] for item in pl_resp['items']]
+        next_page_token = pl_resp.get('nextPageToken')
+        if not next_page_token:
+            break
+    return ids
+
+
+def get_video_details(video_ids, source_name):
+    details = []
+    for i in range(0, len(video_ids), 50):
+        items = youtube.videos().list(
+            part='snippet,statistics,contentDetails',
+            id=','.join(video_ids[i:i + 50])
+        ).execute().get('items', [])
+
+        for v in items:
+            s = v['snippet']
+            stats = v['statistics']
+            cd = v['contentDetails']
+
+            views = int(stats.get('viewCount', 0))
+            likes = int(stats.get('likeCount', 0))
+            comments = int(stats.get('commentCount', 0))
+            published_at = s.get('publishedAt')
+
+            published_dt = (
+                datetime.strptime(published_at, '%Y-%m-%dT%H:%M:%SZ')
+                .replace(tzinfo=timezone.utc) if published_at else None
+            )
+            now = datetime.now(timezone.utc)
+            hours_since_published = ((now - published_dt).total_seconds() / 3600) if published_dt else 1
+
+            engagement_rate = ((likes + comments) / views) if views else 0
+            views_per_hour = (views / hours_since_published) if hours_since_published else 0
+            like_to_view_ratio = (likes / views) if views else 0
+            comment_to_view_ratio = (comments / views) if views else 0
+
+            duration_iso = cd.get('duration')
+            duration_seconds = iso8601_to_seconds(duration_iso) if duration_iso else 0
+            duration_formatted = iso8601_to_str(duration_iso) if duration_iso else ""
+
+            vid = v['id']
+            details.append({
+                'source_name': source_name,
+                'video_name': s.get('title', ''),
+                'video_id': vid,
+                'video_url': f"https://www.youtube.com/watch?v={vid}",
+                'timestamp': int(published_dt.timestamp()) if published_dt else '',
+                'views': views,
+                'likes': likes,
+                'comments': comments,
+                'duration_seconds': duration_seconds,
+                'duration_formatted': duration_formatted,
+                'published_at': published_at,
+                'engagement_rate': round(engagement_rate, 6),
+                'views_per_hour': round(views_per_hour, 3),
+                'like_to_view_ratio': round(like_to_view_ratio, 6),
+                'comment_to_view_ratio': round(comment_to_view_ratio, 6),
+            })
+    return details
+
+
+def get_channel_details(channel_id, source_name):
+    response = youtube.channels().list(
+        part="snippet,statistics,brandingSettings",
+        id=channel_id
+    ).execute()
+
+    if not response["items"]:
+        print("❌ Channel not found:", source_name)
+        return None
+
+    channel = response["items"][0]
+    stats = channel["statistics"]
+    snippet = channel["snippet"]
+    brand = channel.get("brandingSettings", {}).get("channel", {})
+
+    return {
+        "source_name": source_name,
+        "channel_id": channel_id,
+        "channel_name": snippet.get("title", ""),
+        "description": snippet.get("description", ""),
+        "published_at": snippet.get("publishedAt", ""),
+        "country": snippet.get("country", "Unknown"),
+        "subscriber_count": int(stats.get("subscriberCount", 0)),
+        "view_count": int(stats.get("viewCount", 0)),
+        "video_count": int(stats.get("videoCount", 0)),
+        "keywords": brand.get("keywords", ""),
+        "default_language": brand.get("defaultLanguage", "")
+    }
+
+
+# ---------------------- Database Functions ----------------------
+def create_mysql_connection():
+    """
+    Safely create a MySQL connection with UTF-8mb4 support for emojis using PyMySQL.
+    Also ensures the target database exists.
+    """
+    try:
+        # First connect to MySQL server without selecting a DB
+        root_conn = pymysql.connect(
+            host=DB_CONFIG["host"],
+            user=DB_CONFIG["user"],
+            password=DB_CONFIG["password"],
+            charset='utf8mb4'
+        )
+        root_cursor = root_conn.cursor()
+
+        # Create database with utf8mb4 charset
+        root_cursor.execute(
+            f"CREATE DATABASE IF NOT EXISTS {DB_CONFIG['database']} "
+            f"CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+        )
+        root_conn.commit()
+        root_cursor.close()
+        root_conn.close()
+
+        # Then connect to the specific database
+        conn = pymysql.connect(
+            host=DB_CONFIG["host"],
+            user=DB_CONFIG["user"],
+            password=DB_CONFIG["password"],
+            database=DB_CONFIG["database"],
+            charset='utf8mb4'
+        )
+        return conn
+    except Error as e:
+        print("❌ Database connection error:", e)
+        return None
+
+
+def setup_tables():
+    """Create unified tables for all channels/videos with UTF-8mb4 support"""
+    conn = None
+    cursor = None
+    try:
+        conn = create_mysql_connection()
+        if not conn:
+            print("❌ Could not establish MySQL connection.")
+            return
+
+        cursor = conn.cursor()
+
+        # Channel details table with utf8mb4
+        cursor.execute("""
+                       CREATE TABLE IF NOT EXISTS youtube_channel_details
+                       (channel_id VARCHAR (50) PRIMARY KEY,
+                        source_name VARCHAR (255),
+                        channel_name VARCHAR (255),
+                        description TEXT,
+                        published_at VARCHAR(50),
+                        country VARCHAR (50),
+                           subscriber_count BIGINT,
+                           view_count BIGINT,
+                           video_count INT,
+                           keywords TEXT,
+                           default_language VARCHAR(50)
+                           ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+                       """)
+
+        # Videos table with utf8mb4
+        cursor.execute("""
+                       CREATE TABLE IF NOT EXISTS youtube_videos
+                       (
+                        video_id VARCHAR (50) PRIMARY KEY,
+                        source_name VARCHAR (255),
+                        video_name VARCHAR (255),
+                           video_url TEXT,
+                           timestamp BIGINT,
+                           views INT,
+                           likes INT,
+                           comments INT,
+                           duration_seconds INT,
+                           duration_formatted VARCHAR (20),
+                           published_at VARCHAR (50),
+                           engagement_rate FLOAT,
+                           views_per_hour FLOAT,
+                           like_to_view_ratio FLOAT,
+                           comment_to_view_ratio FLOAT
+                           ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+                       """)
+
+        conn.commit()
+        print("✅ Database tables ready with UTF-8mb4 support.")
+    except Error as e:
+        print("❌ Error creating tables:", e)
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
+def save_channel_to_mysql(channel_data):
+    conn = None
+    cursor = None
+    try:
+        conn = create_mysql_connection()
+        if not conn:
+            print("❌ Skipping channel save — no DB connection.")
+            return
+
+        cursor = conn.cursor()
+
+        cursor.execute("""
+                       REPLACE
+                       INTO youtube_channel_details (
+                channel_id, source_name, channel_name, description, published_at,
+                country, subscriber_count, view_count, video_count, keywords, default_language
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                       """, (
+                           channel_data["channel_id"], channel_data["source_name"], channel_data["channel_name"],
+                           channel_data["description"], channel_data["published_at"], channel_data["country"],
+                           channel_data["subscriber_count"], channel_data["view_count"],
+                           channel_data["video_count"], channel_data["keywords"], channel_data["default_language"]
+                       ))
+
+        conn.commit()
+        print(f"✅ Channel data saved for {channel_data['source_name']}")
+    except Error as e:
+        print("❌ Error saving channel details:", e)
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
+def save_videos_to_mysql(df):
+    conn = None
+    cursor = None
+    try:
+        conn = create_mysql_connection()
+        if not conn:
+            print("❌ Skipping video save — no DB connection.")
+            return
+
+        cursor = conn.cursor()
+
+        for _, row in df.iterrows():
+            cursor.execute("""
+                           REPLACE
+                           INTO youtube_videos (
+                    video_id, source_name, video_name, video_url, timestamp, views, likes, comments,
+                    duration_seconds, duration_formatted, published_at, engagement_rate,
+                    views_per_hour, like_to_view_ratio, comment_to_view_ratio
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                           """, (
+                               row['video_id'], row['source_name'], row['video_name'], row['video_url'],
+                               row['timestamp'],
+                               row['views'], row['likes'], row['comments'], row['duration_seconds'],
+                               row['duration_formatted'], row['published_at'], row['engagement_rate'],
+                               row['views_per_hour'], row['like_to_view_ratio'], row['comment_to_view_ratio']
+                           ))
+
+        conn.commit()
+        print("✅ All video data saved to database.")
+    except Error as e:
+        print("❌ Error saving video data:", e)
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
+# ---------------------- MAIN EXECUTION ----------------------
+if __name__ == '__main__':
+    setup_tables()
+
+    all_videos = []  # To consolidate all channel video data
+
+    for source_name, channel_id in CHANNELS.items():
+        print(f"\n📺 Processing channel: {source_name} ({channel_id})")
+
+        channel_info = get_channel_details(channel_id, source_name)
+        if channel_info:
+            save_channel_to_mysql(channel_info)
+
+        pl_id = get_uploads_playlist_id(channel_id)
+        video_ids = get_all_video_ids(pl_id)
+        video_meta = get_video_details(video_ids, source_name)
+        all_videos.extend(video_meta)
+
+    # Convert all videos to one DataFrame
+    df_all = pd.DataFrame(all_videos)
+
+    # Save to local files
+    df_all.to_csv("youtube_videos_all_channels.csv", index=False)
+    df_all.to_excel("youtube_videos_all_channels.xlsx", index=False)
+
+    # Save all to MySQL
+    save_videos_to_mysql(df_all)
+
+    print(f"✅ Done! Total videos processed across all channels: {len(df_all)}")
